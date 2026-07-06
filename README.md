@@ -14,16 +14,16 @@ locally, and how to deploy it as a persistent `systemd` service.
 
 ## Contents
 
-1. [Repo layout](#1-repo-layout)
-2. [Requirements](#2-requirements)
-3. [Quickstart](#3-quickstart)
-4. [How it works](#4-how-it-works)
-5. [CLI commands](#5-cli-commands)
-6. [Production deployment: systemd](#6-production-deployment-systemd)
-7. [Analyst approval workflow](#7-analyst-approval-workflow---approval-mode-json)
-8. [Model lifecycle](#8-model-lifecycle-at-a-glance)
-9. [Key tunables](#9-key-tunables)
-10. [Troubleshooting](#10-troubleshooting)
+1. Repo layout
+2. Requirements
+3. Quickstart
+4. How it works
+5. CLI commands
+6. Production deployment: systemd
+7. Analyst approval workflow
+8. Model lifecycle
+9. Key tunables
+10. Troubleshooting
 
 ---
 
@@ -35,7 +35,7 @@ anomaly_detection import ...`, etc.), so a flat layout like this is
 required for Python's import resolution to work:
 
 ```
-uc09_workspace/
+<your-install-dir>/
 └── scripts/
     ├── feature_extraction.py
     ├── anomaly_detection.py
@@ -46,6 +46,11 @@ uc09_workspace/
     ├── alert_manager.py
     └── realtime_pipeline.py   ← entrypoint, run this one
 ```
+
+`<your-install-dir>` can be anywhere you have read/write access —
+`/opt/uc09`, a directory under your own home folder, wherever. It does not
+need to match any path shown in this README; the examples later on use
+`/opt/uc09` purely as a placeholder to substitute your own.
 
 If your repo's files landed loose in one directory when cloned, you're
 already set — just make sure nothing else shares a name that would shadow
@@ -237,8 +242,42 @@ python realtime_pipeline.py serve --watch-dir ./incoming_logs \
 ## 6. Production deployment: `systemd`
 
 The pipeline is designed to run unattended via `tail` mode under `systemd`.
+The paths below use a placeholder install directory,
+`/opt/uc09` — substitute this with wherever *you* actually have
+read/write access (it does **not** need to be under any particular user's
+home directory; anywhere the service's `User` can read and write works).
 
-### 6.1 Create the service file
+### 6.1 Lay out the directories
+
+Create one top-level directory and the sub-directories the pipeline reads
+from / writes to:
+
+```bash
+sudo mkdir -p /opt/uc09/{scripts,data,model_store,alerts}
+```
+
+| Directory | Purpose |
+|---|---|
+| `scripts/` | All eight `.py` files from this repo, flat, no sub-folders (see [Repo layout](#1-repo-layout)). |
+| `data/` | The NDJSON log file `tail` watches (e.g. `data/live_logs.ndjson`). Your log shipper should append here. |
+| `model_store/` | Created and managed automatically by `model_library.py` (`approved/`, `candidate/`, `metadata/`, and `pending_approval/` if using `--approval-mode json`). You don't need to pre-create its contents — just the parent. |
+| `alerts/` | Where `--alert-out-file` writes `alerts.jsonl`. |
+
+Copy this repo's `.py` files into `scripts/`:
+
+```bash
+cp *.py /opt/uc09/scripts/
+```
+
+Then pick (or create) a user to run the service as — it needs read access
+to `scripts/` and `data/`, and write access to `model_store/` and
+`alerts/`:
+
+```bash
+sudo chown -R <your-service-user>:<your-service-user> /opt/uc09
+```
+
+### 6.2 Create the service file
 
 ```bash
 sudo nano /etc/systemd/system/uc09.service
@@ -251,15 +290,15 @@ After=network.target
 
 [Service]
 Type=simple
-User=fusion
-WorkingDirectory=/home/fusion/framework
+User=<your-service-user>
+WorkingDirectory=/opt/uc09
 
 ExecStart=/usr/bin/python3 \
-    /home/fusion/framework/uc09_workspace/scripts/realtime_pipeline.py \
-    --model-root /home/fusion/framework/uc09_workspace/model_store \
+    /opt/uc09/scripts/realtime_pipeline.py \
+    --model-root /opt/uc09/model_store \
     tail \
-    --input-file /home/fusion/framework/data/moodle_last60days.json \
-    --alert-out-file /home/fusion/framework/uc09_workspace/alerts/alerts.jsonl \
+    --input-file /opt/uc09/data/live_logs.ndjson \
+    --alert-out-file /opt/uc09/alerts/alerts.jsonl \
     --approval-mode json \
     --poll-seconds 30 \
     --min-relative-score 1.0 \
@@ -273,34 +312,33 @@ RestartSec=10
 WantedBy=multi-user.target
 ```
 
-> Adjust `User`, `WorkingDirectory`, and all paths to match your actual
-> layout. Since this repo's files are uploaded individually with no
-> subfolders, place them together under a single directory (e.g.
-> `uc09_workspace/scripts/`) before pointing `ExecStart` at
-> `realtime_pipeline.py` — it imports its sibling modules
-> (`model_library`, `feature_extraction`, `anomaly_detection`,
-> `alert_manager`, `scheduler`, `train_model`, `drift_detection`) directly,
-> so they must all live in the same directory.
+> Replace `<your-service-user>` and every `/opt/uc09` path with your own
+> choices — nothing here is tied to a specific machine or account. The
+> only hard requirement is that `scripts/` contains all eight `.py` files
+> together (`realtime_pipeline.py` imports its siblings directly — see
+> [Repo layout](#1-repo-layout)), and that `User` has read/write
+> permission on whatever paths you point `--input-file`, `--model-root`,
+> and `--alert-out-file` at.
 
-### 6.2 Reload systemd
+### 6.3 Reload systemd
 
 ```bash
 sudo systemctl daemon-reload
 ```
 
-### 6.3 Enable auto-start on boot
+### 6.4 Enable auto-start on boot
 
 ```bash
 sudo systemctl enable uc09
 ```
 
-### 6.4 Start the service
+### 6.5 Start the service
 
 ```bash
 sudo systemctl start uc09
 ```
 
-### 6.5 Check status
+### 6.6 Check status
 
 ```bash
 sudo systemctl status uc09
@@ -312,7 +350,7 @@ Expect to see:
 active (running)
 ```
 
-### 6.6 View live logs
+### 6.7 View live logs
 
 ```bash
 journalctl -u uc09 -f
@@ -320,7 +358,7 @@ journalctl -u uc09 -f
 
 Equivalent to watching the terminal output of a manually-started run.
 
-### 6.7 Stop / restart
+### 6.8 Stop / restart
 
 ```bash
 sudo systemctl stop uc09
@@ -333,16 +371,17 @@ sudo systemctl restart uc09
 
 When a retrained candidate's drift score **exceeds**
 `DRIFT_APPROVAL_THRESHOLD` (see `drift_detection.py`), the scheduler cannot
-safely auto-promote it and instead writes a pending-approval record:
+safely auto-promote it and instead writes a pending-approval record under
+your `--model-root` (using the layout from section 6):
 
 ```
-/home/fusion/framework/uc09_workspace/model_store/pending_approval/approval.json
+/opt/uc09/model_store/pending_approval/approval.json
 ```
 
 **Check the pending request:**
 
 ```bash
-cat /home/fusion/framework/uc09_workspace/model_store/pending_approval/approval.json
+cat /opt/uc09/model_store/pending_approval/approval.json
 ```
 
 It contains the candidate's `drift_score`, the `approval_threshold` it
@@ -352,14 +391,14 @@ exceeded, and a `status` field starting at `"PENDING"`.
 
 ```bash
 sed -i 's/PENDING/APPROVED/' \
-  /home/fusion/framework/uc09_workspace/model_store/pending_approval/approval.json
+  /opt/uc09/model_store/pending_approval/approval.json
 ```
 
 **Reject:**
 
 ```bash
 sed -i 's/PENDING/REJECTED/' \
-  /home/fusion/framework/uc09_workspace/model_store/pending_approval/approval.json
+  /opt/uc09/model_store/pending_approval/approval.json
 ```
 
 The scheduler polls this file roughly every 5 seconds and, on seeing
