@@ -34,7 +34,7 @@ import joblib
 
 from feature_extraction import MODEL_VERSION, FEATURE_COLS, current_config
 
-DEFAULT_ROOT = "model_store"
+DEFAULT_ROOT = "models"
 
 
 def _paths(root: str):
