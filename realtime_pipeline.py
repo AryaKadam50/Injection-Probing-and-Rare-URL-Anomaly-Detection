@@ -28,7 +28,7 @@ Usage
 -----
 Batch/backfill mode (score one file against whatever is currently approved):
 
-    python realtime_pipeline.py score --input moodle_day15_28.json
+    python realtime_pipeline.py score --input access_logs_day15_28.json
 
 Continuous mode, one file per arrival batch (day-by-day or window-by-window dumps):
 
@@ -38,12 +38,12 @@ Continuous mode from a SINGLE file spanning many days (e.g. a 60-day export)
 — records are auto-sliced into 14-day windows by timestamp, no pre-splitting
 into separate files required:
 
-    python realtime_pipeline.py stream --input-file dataset/moodle_last60days.json \
+    python realtime_pipeline.py stream --input-file dataset/access_logs_100days.json \
         --auto-approve --alert-json-dir alerts/
 
 Bootstrap (Window 1, no approved model yet — trains + auto-approves V1):
 
-    python realtime_pipeline.py bootstrap --input moodle_day1_14.json
+    python realtime_pipeline.py bootstrap --input access_logs_day1_14.json
 
 See README.md for the full walkthrough across multiple windows.
 """
@@ -186,8 +186,8 @@ def run_stream_from_file(input_file: str, root: str, alert_json_dir: str = None,
                           auto_approve: bool = False) -> None:
     """
     Same continuous workflow as run_stream(), but for a SINGLE file spanning
-    many days (e.g. moodle_last60days.json) instead of one file per arrival
-    batch. Records are sliced into consecutive 14-day windows purely from
+    many days (e.g. access_logs_last60days.json) instead of one file per
+    arrival batch. Records are sliced into consecutive 14-day windows purely from
     their own timestamps — no pre-splitting into separate files needed.
 
     For each 14-day slice, in order:
