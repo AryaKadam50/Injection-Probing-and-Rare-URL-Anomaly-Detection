@@ -14,16 +14,16 @@ locally, and how to deploy it as a persistent `systemd` service.
 
 ## Contents
 
-1. Repo layout
-2. Requirements
-3. Quickstart
-4. How it works
-5. CLI commands
-6. Production deployment: systemd
-7. Analyst approval workflow
-8. Model lifecycle
-9. Key tunables
-10. Troubleshooting
+1. [Repo layout](#1-repo-layout)
+2. [Requirements](#2-requirements)
+3. [Quickstart](#3-quickstart)
+4. [How it works](#4-how-it-works)
+5. [CLI commands](#5-cli-commands)
+6. [Production deployment: systemd](#6-production-deployment-systemd)
+7. [Analyst approval workflow](#7-analyst-approval-workflow---approval-mode-json)
+8. [Model lifecycle](#8-model-lifecycle-at-a-glance)
+9. [Key tunables](#9-key-tunables)
+10. [Troubleshooting](#10-troubleshooting)
 
 ---
 
@@ -184,7 +184,7 @@ stored.
 ### `bootstrap` — train the very first model (Window 1)
 
 ```bash
-python realtime_pipeline.py bootstrap --input moodle_day1_14.json
+python realtime_pipeline.py bootstrap --input access_logs_day1_14.json
 ```
 
 Trains directly from the input file and auto-approves it, since there is no
@@ -193,7 +193,7 @@ existing approved model to compare drift against yet.
 ### `score` — score one batch against the currently approved model
 
 ```bash
-python realtime_pipeline.py score --input moodle_day15_28.json \
+python realtime_pipeline.py score --input access_logs_day15_28.json \
     --alert-json-out alerts/batch1.json
 ```
 
@@ -204,7 +204,7 @@ python realtime_pipeline.py score --input moodle_day15_28.json \
 python realtime_pipeline.py stream --input-dir ./daily_logs --poll-seconds 5
 
 # A single file spanning many days — auto-sliced into 14-day windows
-python realtime_pipeline.py stream --input-file dataset/moodle_last60days.json \
+python realtime_pipeline.py stream --input-file dataset/access_logs_last60days.json \
     --auto-approve --alert-json-dir alerts/
 ```
 
