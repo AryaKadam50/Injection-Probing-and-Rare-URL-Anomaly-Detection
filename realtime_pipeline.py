@@ -616,7 +616,7 @@ def run_serve(watch_dir: str, root: str, poll_seconds: int, alert_json_dir: str 
 def main():
     parser = argparse.ArgumentParser(description="UC-09 real-time rolling-retraining pipeline (14-day windows)")
     parser.add_argument("--model-root", default=model_library.DEFAULT_ROOT,
-                         help="Model library root directory (default: ./model_store)")
+                         help="Model library root directory (default: ./models)")
     sub = parser.add_subparsers(dest="command", required=True)
 
     p_bootstrap = sub.add_parser("bootstrap", help="Train + auto-approve the very first (Window 1) model")
