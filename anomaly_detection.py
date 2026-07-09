@@ -78,7 +78,7 @@ def apply_alert_gate(rows: list, fused_threshold: float, catastrophic_threshold:
 
     0.0 = just cleared this model's burst gate; 1.0 = at this model's
     catastrophic threshold; >1.0 = beyond it. Because every model's
-    fused_threshold/catastrophic_threshold are derived the same way (99.7th
+    fused_threshold/catastrophic_threshold are derived the same way (99.9th
     / 99.99th percentile of ITS OWN training scores — see train_model.py),
     relative_score means roughly the same thing across model versions, so
     a single fixed cutoff on it stays meaningful even as models retrain
