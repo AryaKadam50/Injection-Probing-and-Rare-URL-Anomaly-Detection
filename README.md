@@ -31,8 +31,9 @@ locally, and how to deploy it as a persistent `systemd` service.
 
 All eight modules must live in the **same directory** — `realtime_pipeline.py`
 imports its siblings directly (`import model_library`, `from
-anomaly_detection import ...`, etc.), so a flat layout like this is
-required for Python's import resolution to work:
+anomaly_detection import ...`, `from scheduler import
+RollingRetrainingScheduler`, etc.), so a flat layout like this is required
+for Python's import resolution to work:
 
 ```
 <your-install-dir>/
@@ -54,18 +55,18 @@ need to match any path shown in this README; the examples later on use
 
 If your repo's files landed loose in one directory when cloned, you're
 already set — just make sure nothing else shares a name that would shadow
-`model_library` (keep the model storage root, e.g. `model_store/`, named
+`model_library` (keep the model storage root, e.g. `models/`, named
 differently from any importable package).
 
 | File | Role |
 |---|---|
-| `feature_extraction.py` | Log parsing, path/query normalization, per-path baselines, entity-window feature aggregation (`FEATURE_COLS`), and all detection constants (window size, gate thresholds, etc.). |
-| `anomaly_detection.py` | Scores entity-windows against a model bundle (IF + LOF fusion, legit-path discount), applies the burst/catastrophic alert gate, assigns severity, and provides explainability helpers (`top_signals`, `worst_urls`). |
-| `train_model.py` | Fits a fresh `StandardScaler` + `IsolationForest` + `LocalOutlierFactor` on one 14-day window of data and packages everything into a joblib "bundle". |
-| `model_library.py` | Versioned on-disk storage for model bundles (`candidate/`, `approved/`, `metadata/`). Only one model is ever "approved & active" for scoring at a time. |
-| `drift_detection.py` | Compares a candidate model against the currently approved one (feature drift via PSI/KL, score drift, threshold drift) and decides whether the change needs human review. |
-| `scheduler.py` | Owns the rolling train → drift-review → approve/reject lifecycle. Runs candidate training on a background thread so it never blocks live detection. |
-| `alert_manager.py` | Alert presentation: human-readable console alerts and JSON output for SOC/SIEM ingestion (one JSON object **per anomalous URL**, not per window). |
+| `feature_extraction.py` | Log parsing (`load_logs`, `parse_event`), path/query normalization, per-path baselines (`build_path_query_baseline`), entity-window feature aggregation (`build_entity_windows`, `FEATURE_COLS`), and all detection constants (window size, gate thresholds, etc.). |
+| `anomaly_detection.py` | Scores entity-windows against a model bundle (`score_rows` — IF + LOF fusion with the legit-path discount), applies the burst/catastrophic alert gate (`apply_alert_gate`), assigns severity (`assign_severities`), and provides explainability helpers (`top_signals`, `worst_urls`). |
+| `train_model.py` | Fits a fresh `StandardScaler` + `IsolationForest` + `LocalOutlierFactor` on one 14-day window of data (`train_models`) and packages everything into a joblib "bundle" (`build_bundle`, `train_candidate_from_records`). |
+| `model_library.py` | Versioned on-disk storage for model bundles (`candidate/`, `approved/`, `metadata/`). Only one model is ever "approved & active" for scoring at a time (`get_active_model`, `approve_model`, `rollback_model`). |
+| `drift_detection.py` | Compares a candidate model against the currently approved one (feature drift via PSI/KL, score drift, threshold drift) and decides whether the change needs human review (`compare_models`, `DRIFT_APPROVAL_THRESHOLD`). |
+| `scheduler.py` | Owns the rolling train → drift-review → approve/reject lifecycle (`RollingRetrainingScheduler`). Runs candidate training on a background thread so it never blocks live detection. |
+| `alert_manager.py` | Alert presentation: human-readable console alerts (`print_alert`) and JSON output for SOC/SIEM ingestion (`save_alert_json` — one JSON object **per anomalous URL**, not per window). |
 | `realtime_pipeline.py` | The production entrypoint / CLI. Wires the modules above into `bootstrap`, `score`, `stream`, `tail`, and `serve` commands. |
 
 ---
@@ -97,9 +98,10 @@ python realtime_pipeline.py score --input logs_day15_28.json \
 cat alerts/batch1.json
 ```
 
-`model_store/` and `alerts/` are created automatically on first run. Once
-this works locally, jump to [Production deployment](#6-production-deployment-systemd)
-to run it continuously.
+`models/` (the default `--model-root`) and any `alerts/` directory you
+point at are created automatically on first run. Once this works locally,
+jump to [Production deployment](#6-production-deployment-systemd) to run
+it continuously.
 
 ---
 
@@ -123,10 +125,12 @@ Score                (anomaly_detection.py — IF + LOF + GMM fusion)
 Alert Manager        (alert_manager.py — console and/or SOC JSON)
 ```
 
-In parallel, every batch of records is also fed into
-`RollingRetrainingScheduler`, which accumulates a rolling 14-day buffer and,
-once a window completes, trains the next candidate model **on a background
-thread** and runs it through drift review — all without pausing detection.
+In parallel, every batch of records handed to `stream`, `tail`, or `serve`
+is also fed into `RollingRetrainingScheduler.ingest_records()`, which
+accumulates a rolling 14-day buffer (`RollingLogBuffer`, 2 weeks retention)
+and, once a window completes, trains the next candidate model **on a
+background thread** and runs it through drift review — all without
+pausing detection.
 
 ### 4.2 From raw requests to an entity-window
 
@@ -142,9 +146,10 @@ below that, the statistics are too noisy to trust.
 Each entity-window's feature vector is scored by both an `IsolationForest`
 and a `LocalOutlierFactor`, normalized to `[0, 1]`, and combined into a
 single `fused_score` (with a discount applied for traffic that's mostly
-hitting well-known/legit paths). A `GaussianMixture` model separately
-produces an `anomaly_prob` — an *informational* confidence score that is
-never itself the alert trigger.
+hitting well-known/legit paths — the `legit_path_ratio` discount in
+`score_rows()`). A `GaussianMixture` model separately produces an
+`anomaly_prob` — an *informational* confidence score that is never itself
+the alert trigger.
 
 An entity-window only becomes an **alert** if it clears one of two gates in
 `apply_alert_gate()`:
@@ -161,24 +166,31 @@ An entity-window only becomes an **alert** if it clears one of two gates in
     recon/enumeration noise that clears the same raw count purely on
     volume (e.g. 63 of 38,377 — 0.16%).
 - **Catastrophic gate** — a very high `fused_score` (past
-  `catastrophic_threshold`) *and* a landed 5xx response in the window.
+  `catastrophic_threshold`) *and* a landed 5xx response in the window
+  (`status_500_ratio > 0`).
 
 Alerts that clear either gate get a `severity` (`LOW`/`MEDIUM`/`HIGH`,
-relative to that batch's own score distribution) and a `relative_score`
-normalized against the *active model's own* thresholds (`0.0` = just
-cleared the burst gate, `1.0` = at the catastrophic threshold). Because
-every model's thresholds are derived the same way from its own training
-data, `relative_score` stays comparable across model versions even as raw
-`fused_score` drifts between retrains — this is why `--min-relative-score`
-is the recommended way to set a stable alerting bar, not a hand-picked
-`fused_score` cutoff.
+relative to that batch's own score distribution, via `assign_severities`)
+and a `relative_score` normalized against the *active model's own*
+thresholds (`0.0` = just cleared the burst gate, `1.0` = at the
+catastrophic threshold). Because every model's thresholds are derived the
+same way from its own training data (99.9th / 99.99th percentile of its
+own training scores), `relative_score` stays comparable across model
+versions even as raw `fused_score` drifts between retrains — this is why
+`--min-relative-score` is the recommended way to set a stable alerting
+bar, not a hand-picked `fused_score` cutoff.
+
+Alert output is **one JSON object per anomalous URL**, not per window —
+`alerts_per_url()` explodes each alerting window's `worst_urls()` list
+into individual alert records that share the same IP/window/score
+context, so downstream SOC tooling gets one ticket-worthy item per URL.
 
 ---
 
 ## 5. CLI commands
 
 All commands are run through `realtime_pipeline.py` and accept
-`--model-root` (default `./model_store`) to control where model bundles are
+`--model-root` (default `./models`) to control where model bundles are
 stored.
 
 ### `bootstrap` — train the very first model (Window 1)
@@ -208,6 +220,9 @@ python realtime_pipeline.py stream --input-file dataset/access_logs_last60days.j
     --auto-approve --alert-json-dir alerts/
 ```
 
+`--auto-approve` skips drift review entirely and promotes every candidate
+— useful for backtests/demos, not recommended for production.
+
 ### `tail` — watch ONE continuously-appended NDJSON file (recommended for production)
 
 ```bash
@@ -223,12 +238,12 @@ the mode used in the systemd setup below. Key flags:
 
 | Flag | Purpose |
 |---|---|
-| `--approval-mode {safe,auto,console,json}` | How retrain candidates get promoted. `safe`: auto-promote unless drift is extreme (auto-reject instead, never blocks). `auto`: always promote. `console`: blocks on a Y/N prompt (interactive use only). `json`: writes a `pending_approval/approval.json` file and waits for an analyst to edit it (headless-friendly, human-in-the-loop). |
-| `--history {auto,resume,replay}` | `auto` (default): no active model yet → full progressive replay of file history; active model already exists → resume from saved byte offset. Safe to use for both first launch and every restart. |
-| `--min-relative-score` | Drop alerts below this `relative_score` (normalized 0–1 against each model's own thresholds — stays meaningful across model versions, unlike raw `fused_score`). |
-| `--high-only` | Only keep `HIGH` severity alerts. |
-| `--require-landed-error` | Only keep alerts where a request actually returned a 5xx (filters out pure recon/scanning noise). |
-| `--max-urls-per-alert` | Caps how many distinct-URL alert lines one anomalous window can emit. |
+| `--approval-mode {safe,auto,console,json}` | How retrain candidates get promoted. `safe` (default): auto-promote unless drift is extreme (auto-reject instead, never blocks). `auto`: always promote, no safety net. `console`: blocks on a Y/N prompt (interactive use only — hangs under systemd). `json`: writes a `pending_approval/approval.json` file and waits for an analyst to edit it (headless-friendly, human-in-the-loop). |
+| `--history {auto,resume,replay}` | `auto` (default): no active model yet → full progressive replay of file history; active model already exists → resume from saved byte offset. Safe to use for both first launch and every restart. `resume`: never reprocess history. `replay`: force a fresh progressive rebuild even if a model already exists. |
+| `--min-relative-score` | Drop alerts below this `relative_score` (normalized 0–1 against each model's own thresholds — stays meaningful across model versions, unlike raw `fused_score`). Default: no filtering. |
+| `--high-only` | Only keep `HIGH` severity alerts. Severity is relative to each scoring batch, not a fixed cutoff — combine with `--min-relative-score` for a stable bar. |
+| `--require-landed-error` | Only keep alerts where `status_500_ratio > 0` — i.e. a request in the window actually returned a 5xx, not just a statistically loud burst. Filters out mass recon/scanning noise (probing `/.env`, `/wp-content/*`, `/cgi-bin/php`, etc.) that can clear a high `relative_score` purely on volume while being all-404s. |
+| `--max-urls-per-alert` | Caps how many distinct-URL alert lines one anomalous window can emit (default: uncapped). Does not change which windows count as anomalous — only limits fan-out for one loud campaign hitting many paths in the same window. |
 
 ### `serve` — watch a directory for new/rotated log files
 
@@ -253,14 +268,14 @@ Create one top-level directory and the sub-directories the pipeline reads
 from / writes to:
 
 ```bash
-sudo mkdir -p /opt/uc09/{scripts,data,model_store,alerts}
+sudo mkdir -p /opt/uc09/{scripts,data,models,alerts}
 ```
 
 | Directory | Purpose |
 |---|---|
 | `scripts/` | All eight `.py` files from this repo, flat, no sub-folders (see [Repo layout](#1-repo-layout)). |
 | `data/` | The NDJSON log file `tail` watches (e.g. `data/live_logs.ndjson`). Your log shipper should append here. |
-| `model_store/` | Created and managed automatically by `model_library.py` (`approved/`, `candidate/`, `metadata/`, and `pending_approval/` if using `--approval-mode json`). You don't need to pre-create its contents — just the parent. |
+| `models/` | Created and managed automatically by `model_library.py` (`approved/`, `candidate/`, `metadata/`, and `pending_approval/` if using `--approval-mode json`). You don't need to pre-create its contents — just the parent. |
 | `alerts/` | Where `--alert-out-file` writes `alerts.jsonl`. |
 
 Copy this repo's `.py` files into `scripts/`:
@@ -270,8 +285,7 @@ cp *.py /opt/uc09/scripts/
 ```
 
 Then pick (or create) a user to run the service as — it needs read access
-to `scripts/` and `data/`, and write access to `model_store/` and
-`alerts/`:
+to `scripts/` and `data/`, and write access to `models/` and `alerts/`:
 
 ```bash
 sudo chown -R <your-service-user>:<your-service-user> /opt/uc09
@@ -295,7 +309,7 @@ WorkingDirectory=/opt/uc09
 
 ExecStart=/usr/bin/python3 \
     /opt/uc09/scripts/realtime_pipeline.py \
-    --model-root /opt/uc09/model_store \
+    --model-root /opt/uc09/models \
     tail \
     --input-file /opt/uc09/data/live_logs.ndjson \
     --alert-out-file /opt/uc09/alerts/alerts.jsonl \
@@ -375,13 +389,13 @@ safely auto-promote it and instead writes a pending-approval record under
 your `--model-root` (using the layout from section 6):
 
 ```
-/opt/uc09/model_store/pending_approval/approval.json
+/opt/uc09/models/pending_approval/approval.json
 ```
 
 **Check the pending request:**
 
 ```bash
-cat /opt/uc09/model_store/pending_approval/approval.json
+cat /opt/uc09/models/pending_approval/approval.json
 ```
 
 It contains the candidate's `drift_score`, the `approval_threshold` it
@@ -391,14 +405,14 @@ exceeded, and a `status` field starting at `"PENDING"`.
 
 ```bash
 sed -i 's/PENDING/APPROVED/' \
-  /opt/uc09/model_store/pending_approval/approval.json
+  /opt/uc09/models/pending_approval/approval.json
 ```
 
 **Reject:**
 
 ```bash
 sed -i 's/PENDING/REJECTED/' \
-  /opt/uc09/model_store/pending_approval/approval.json
+  /opt/uc09/models/pending_approval/approval.json
 ```
 
 The scheduler polls this file roughly every 5 seconds and, on seeing
@@ -429,7 +443,7 @@ either way.
 ## 8. Model lifecycle at a glance
 
 ```
-model_store/
+models/
   approved/         # .joblib bundles currently or previously active
   candidate/        # awaiting drift review / approval
   metadata/         # one JSON record per model_id + active.json
@@ -442,11 +456,16 @@ model_store/
   detection actually scores against.
 - `rollback_model()` can revert to any previously approved version if a
   newly promoted model turns out to alert-flood or go silent in
-  production.
+  production — it just repoints `active.json`, so it's instant and
+  doesn't touch the `approved/` bundles themselves.
+- `reject_candidate()` discards a candidate a human reviewer declined to
+  promote, leaving the currently active model untouched.
 
 ---
 
-## 9. Key tunables (`feature_extraction.py`)
+## 9. Key tunables
+
+### `feature_extraction.py`
 
 | Constant | Current value | Effect |
 |---|---|---|
@@ -456,8 +475,16 @@ model_store/
 | `MIN_BREAK_RATIO` | 0.05 | Minimum *fraction* of a window's requests that must be grammar-breaking — see below. |
 | `ALERT_PCT` | 99.9 | Training-score percentile used to derive `fused_threshold`. |
 | `CATASTROPHIC_PCT` | 99.99 | Training-score percentile used to derive `catastrophic_threshold`. |
-| `DRIFT_APPROVAL_THRESHOLD` (`drift_detection.py`) | 0.59 | Drift score above which a retrained candidate requires human/analyst approval instead of auto-promoting. |
-| `SAFE_AUTO_REJECT_ABOVE` (`scheduler.py`) | 0.85 | In `safe` approval mode, drift above this is auto-rejected rather than promoted. |
+| `SCORE_BOUND_PCT_LOW` / `SCORE_BOUND_PCT_HIGH` | 0.5 / 99.5 | Percentile bounds used to normalize raw IF/LOF scores into `[0, 1]`. |
+
+### `drift_detection.py` / `scheduler.py`
+
+| Constant | Current value | Effect |
+|---|---|---|
+| `DRIFT_APPROVAL_THRESHOLD` | 0.59 | Drift score above which a retrained candidate requires human/analyst approval instead of auto-promoting. |
+| `SAFE_AUTO_REJECT_ABOVE` | 0.85 | In `safe` approval mode, drift above this is auto-rejected rather than promoted. |
+| `WEIGHT_FEATURE` / `WEIGHT_SCORE` / `WEIGHT_THRESHOLD` | 0.5 / 0.3 / 0.2 | How feature drift (PSI/KL on the training matrix), score drift (PSI on IF/LOF/fused training scores), and threshold drift (relative change in `fused_threshold`/`catastrophic_threshold`) combine into one `drift_score`. |
+| `WEEK` (retraining cadence) | 14 days | How much new data accumulates before the scheduler kicks off background training of the next candidate. |
 
 `MIN_REQUESTS`, `MIN_BREAK_URLS`, and `MIN_BREAK_RATIO` act at different
 stages of the pipeline and are easy to conflate:
@@ -483,7 +510,7 @@ stages of the pipeline and are easy to conflate:
   just noise in a big pile of scanning traffic). Both `break_count >= 25`
   **and** `break_ratio >= 0.05` must hold for the burst gate to trigger.
 
-Changing any of these and wiping `model_store/` warrants an explicit
+Changing any of these and wiping `models/` warrants an explicit
 `--history replay` on the next `tail` run to rebuild models from scratch.
 
 ---
@@ -493,9 +520,10 @@ Changing any of these and wiping `model_store/` warrants an explicit
 | Symptom | Likely cause / fix |
 |---|---|
 | `ModuleNotFoundError: No module named 'model_library'` (or similar) | Not all `.py` files are in the same directory as `realtime_pipeline.py` — see [Repo layout](#1-repo-layout). |
-| `[realtime_pipeline] No approved model yet — cannot score.` | No model has been bootstrapped/approved yet. Run `bootstrap` first, or use `tail --history auto`, which bootstraps automatically on a fresh `model_store/`. |
+| `[realtime_pipeline] No approved model yet — cannot score.` | No model has been bootstrapped/approved yet. Run `bootstrap` first, or use `tail --history auto`, which bootstraps automatically on a fresh `models/` directory. |
 | Pipeline hangs with no output under `systemd` | You're using `--approval-mode console`, which blocks on `input()`. There's no terminal attached under `systemd` to answer it. Use `safe`, `auto`, or `json` for headless deployment instead. |
 | `approval.json` never resolves | The scheduler polls it every ~5 seconds but only while a candidate is genuinely pending — check `cat .../pending_approval/approval.json` for `"status": "PENDING"`, then flip it with the `sed` commands in [section 7](#7-analyst-approval-workflow---approval-mode-json). |
 | No new alerts appear even though the file is growing | With `tail --history resume`, only bytes appended *after* the saved offset are read. Check the sidecar `<input_file>.tail_offset` file, and confirm new lines are complete, newline-terminated NDJSON (a trailing partial line is intentionally held back until it's finished). |
-| Way more/fewer alerts than expected after a config change | Detection constants (`MIN_BREAK_URLS`, `ALERT_PCT`, etc.) are baked into each trained model's thresholds. Changing them requires retraining — wipe `model_store/` and rerun with `--history replay` (or `bootstrap`) so every model reflects the new config. |
+| Way more/fewer alerts than expected after a config change | Detection constants (`MIN_BREAK_URLS`, `ALERT_PCT`, etc.) are baked into each trained model's thresholds. Changing them requires retraining — wipe `models/` and rerun with `--history replay` (or `bootstrap`) so every model reflects the new config. |
 | `journalctl -u uc09 -f` shows nothing | Confirm the unit is actually active with `systemctl status uc09`; if it's not, check `ExecStart`'s paths (`realtime_pipeline.py` path, `--input-file`, `--model-root`) are correct and the `User` running the service has read/write permission on them. |
+| `ValueError: Only N entity-windows ... too few to train` | The 14-day window handed to `train_candidate_from_records()` produced fewer than 10 entity-windows (usually too little traffic, or too many IPs under `MIN_REQUESTS`). Training for that window is skipped and the scheduler keeps serving on the current model — widen the window or check log volume. |
